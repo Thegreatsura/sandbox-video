@@ -1,8 +1,15 @@
 name: Publish npm package
 
 on:
-  release:
-    types: [published]
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Existing release tag to publish
+        required: true
+        type: string
 
 permissions:
   contents: read
@@ -23,8 +30,12 @@ jobs:
       - run: pnpm check
       - run: pnpm test
       - name: Check release tag
+        env:
+          RELEASE_TAG: ${{ inputs.release_tag }}
         run: >-
           node --input-type=module --eval
           'import packageJson from "./package.json" with { type: "json" };
-          if (`v${packageJson.version}` !== process.env.GITHUB_REF_NAME) process.exit(1)'
+          const tag = process.env.GITHUB_REF_TYPE === "tag"
+          ? process.env.GITHUB_REF_NAME : process.env.RELEASE_TAG;
+          if (`v${packageJson.version}` !== tag) process.exit(1)'
       - run: npm publish --access public
