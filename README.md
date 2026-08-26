@@ -28,11 +28,18 @@ The coding agent is already running inside the Vercel Sandbox:
 start -> use returned agent-browser command -> status -> stop -> uploads.sh URL
 ```
 
-Start recording before the final browser validation:
+Start recording on the page you want to validate:
 
 ```sh
-sandbox-video start --fps 60 --size 1920x1080
+sandbox-video start \
+  --url http://127.0.0.1:3000 \
+  --fps 60 \
+  --size 1920x1080
 ```
+
+The CLI opens `--url` before FFmpeg starts. This keeps browser startup and the
+black X11 root window out of the recording. If `--url` is omitted, the browser
+opens `about:blank`.
 
 `sandbox-video --help` is the runtime contract for an agent. It writes a JSON
 manifest containing commands, typed parameters, effects, exit codes, the exact
@@ -59,7 +66,7 @@ command leaves stdout empty and writes one JSON error envelope to stderr:
     ]
   },
   "meta": {
-    "cliVersion": "0.1.1",
+    "cliVersion": "0.1.2",
     "command": "start",
     "effect": "recording-started"
   }
@@ -72,7 +79,7 @@ The agent must reuse every argument in `agentBrowserCommand`:
 agent-browser \
   --namespace sv-865a538554c04efa \
   --session sv-865a538554c04efa \
-  open http://127.0.0.1:3000
+  snapshot
 
 agent-browser \
   --namespace sv-865a538554c04efa \
@@ -158,10 +165,10 @@ npm install --global .
 Install the published CLI inside a prepared Sandbox image:
 
 ```sh
-npm install --global sandbox-video@0.1.1
+npm install --global sandbox-video@0.1.2
 ```
 
-An agent can instead use `npx --yes sandbox-video@0.1.1 <command>`. Pin the
+An agent can instead use `npx --yes sandbox-video@0.1.2 <command>`. Pin the
 same exact version for `start`, `status`, and `stop`. There is intentionally no
 self-update command or automatic update check: npm/npx owns installation, and
 the response schema must not change in the middle of a recording lifecycle.
@@ -205,10 +212,17 @@ The interactive React fixture lives in
 [`benchmarks/recording-test-rig`](./benchmarks/recording-test-rig). It is a
 benchmark, not shipped npm code.
 
-On August 26, 2026, the release candidate passed all 13 package tests inside a
+On August 26, 2026, the release candidate passed all 14 package tests inside a
 4-vCPU Vercel Sandbox. The Linux-only cases cover concurrent stop calls,
 dead-supervisor recovery, browser-cleanup retry, publication-verification retry,
-and idempotent terminal results.
+idempotent terminal results, and the browser-before-FFmpeg startup order.
+
+The v0.1.2 verification opened the target page before capture, interacted with
+it through the returned agent-browser session, and confirmed that live capture
+advanced from frame 116 to frame 221. The
+[hosted proof](https://storage.uploads.sh/curtis-arch/screenshots/sandbox-video/3aa7e879-bbcd-422d-a085-e90219c52220/proof.mp4)
+contains 271 frames at exactly 60 FPS. Its first-frame average luma was 224.2,
+and FFmpeg detected no black interval at the start.
 
 The same run installed the CLI, built the React fixture, and used its returned
 agent-browser session to start the timer, change animation timing, flash the

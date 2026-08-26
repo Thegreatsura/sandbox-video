@@ -9,7 +9,9 @@ Use this skill only inside a prepared Vercel Sandbox. The CLI controls the
 recording lifecycle; `agent-browser` controls the browser.
 
 1. Run `sandbox-video --help` and parse its JSON response.
-2. Run `sandbox-video start --fps 60 --size 1920x1080`.
+2. Run `sandbox-video start --url <target> --fps 60 --size 1920x1080`. The CLI
+   opens the target before capture starts, so use the page you want in the
+   first video frame.
 3. Retain `data.recordingId` and the complete `data.agentBrowserCommand` array.
 4. Append each `agent-browser` action to that exact command array. Do not create
    a different namespace or session.

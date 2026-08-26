@@ -452,6 +452,33 @@ async function supervise(configPath: string): Promise<void> {
       "_NET_SUPPORTING_WM_CHECK(WINDOW)",
     );
 
+    const agentEnvironment = {
+      ...displayEnvironment,
+      AGENT_BROWSER_SESSION: agentBrowserSession,
+      AGENT_BROWSER_NAMESPACE: agentBrowserNamespace,
+      AGENT_BROWSER_HEADED: "1",
+      AGENT_BROWSER_NO_XVFB: "1",
+      AGENT_BROWSER_ALLOW_FILE_ACCESS: "1",
+      AGENT_BROWSER_ARGS: "--start-maximized",
+    };
+    state = await updateState(state, { browserStartAttemptedAt: new Date().toISOString() });
+    requireSuccess(
+      "agent-browser bootstrap",
+      await runExact(
+        [
+          config.executables.agentBrowser,
+          "--session",
+          agentBrowserSession,
+          "--namespace",
+          agentBrowserNamespace,
+          "--headed",
+          "open",
+          config.initialUrl,
+        ],
+        { environment: agentEnvironment, timeoutMs: config.startupTimeoutMs },
+      ),
+    );
+
     const keyframeInterval = config.fps * 2;
     ffmpeg = await spawnManaged(
       [
@@ -512,32 +539,6 @@ async function supervise(configPath: string): Promise<void> {
     state = await updateState(state, { ffmpeg: ffmpeg.identity });
     await waitForFfmpeg(ffmpeg, paths.ffmpegProgressPath, config.startupTimeoutMs);
 
-    const agentEnvironment = {
-      ...displayEnvironment,
-      AGENT_BROWSER_SESSION: agentBrowserSession,
-      AGENT_BROWSER_NAMESPACE: agentBrowserNamespace,
-      AGENT_BROWSER_HEADED: "1",
-      AGENT_BROWSER_NO_XVFB: "1",
-      AGENT_BROWSER_ALLOW_FILE_ACCESS: "1",
-      AGENT_BROWSER_ARGS: "--start-maximized",
-    };
-    state = await updateState(state, { browserStartAttemptedAt: new Date().toISOString() });
-    requireSuccess(
-      "agent-browser bootstrap",
-      await runExact(
-        [
-          config.executables.agentBrowser,
-          "--session",
-          agentBrowserSession,
-          "--namespace",
-          agentBrowserNamespace,
-          "--headed",
-          "open",
-          config.initialUrl,
-        ],
-        { environment: agentEnvironment, timeoutMs: config.startupTimeoutMs },
-      ),
-    );
     state = await updateState(state, { phase: "recording" });
 
     const event = await Promise.race([

@@ -49,3 +49,17 @@ stop, final media validation, hosted object response, and process cleanup.
 Keep changes focused. Explain the user-visible behavior, the failure mode being
 prevented, and the verification performed. Update the root README when the CLI,
 encoding profile, installation path, or durability boundary changes.
+
+## Releases
+
+The version in `package.json` and the GitHub release tag must match. A release
+for package version `1.2.3` therefore uses tag `v1.2.3`.
+
+Publishing a GitHub Release runs `.github/workflows/publish.yml`. The workflow
+installs the pinned pnpm dependencies, runs `pnpm check` and `pnpm test`, checks
+the tag, and publishes through npm trusted publishing. npm uses GitHub's OIDC
+identity for that one run, so the repository does not store an npm write token.
+
+Do not run `npm publish` from a development machine for routine releases. If a
+publish job fails, fix the cause and rerun that job. Never reuse a version that
+npm already accepted.

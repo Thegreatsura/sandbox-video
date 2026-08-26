@@ -12,7 +12,7 @@ import {
   type RecordingSessionStatus,
 } from "./session.js";
 
-const CLI_VERSION = "0.1.1";
+const CLI_VERSION = "0.1.2";
 const SCHEMA_VERSION = 1 as const;
 const RUNTIME_ROOT = "/tmp/sandbox-video";
 const DEFAULT_WIDTH = 1920;
@@ -37,6 +37,13 @@ const COMMANDS = [
         required: false,
         default: "1920x1080",
         pattern: "WIDTHxHEIGHT",
+      },
+      {
+        name: "--url",
+        type: "string",
+        required: false,
+        default: "about:blank",
+        description: "Open this page before display capture starts.",
       },
       {
         name: "--uploads-workspace",
@@ -147,7 +154,7 @@ async function main(argv: readonly string[]): Promise<number> {
 }
 
 async function startCommand(argv: readonly string[]): Promise<number> {
-  const flags = parseFlags(argv, new Set(["fps", "size", "uploads-workspace"]));
+  const flags = parseFlags(argv, new Set(["fps", "size", "url", "uploads-workspace"]));
   const recordingId = randomUUID();
   const fpsValue = integer(optionalFlag(flags, "fps") ?? String(DEFAULT_FPS), "--fps");
   if (fpsValue !== 30 && fpsValue !== 60) throw new UsageError("--fps must be 30 or 60");
@@ -155,12 +162,14 @@ async function startCommand(argv: readonly string[]): Promise<number> {
     optionalFlag(flags, "size") ?? `${DEFAULT_WIDTH}x${DEFAULT_HEIGHT}`,
   );
   const workspace = optionalFlag(flags, "uploads-workspace") ?? process.env.UPLOADS_WORKSPACE;
+  const initialUrl = optionalFlag(flags, "url");
   const state = await startSession({
     recordingId,
     runtimeDirectory: runtimeDirectoryFor(recordingId),
     width,
     height,
     fps: fpsValue,
+    ...(initialUrl === undefined ? {} : { initialUrl }),
     upload: {
       key: `screenshots/sandbox-video/${recordingId}/proof.mp4`,
       ...(workspace === undefined ? {} : { workspace }),

@@ -40,6 +40,13 @@ test("--help describes the complete command contract as JSON", () => {
     "contentType",
     "sizeBytes",
   ]);
+  const start = commands.find((command) => command.name === "start");
+  assert.ok(start !== undefined);
+  const startParameters = array(start.parameters).map(object);
+  assert.equal(
+    startParameters.find((parameter) => parameter.name === "--url")?.default,
+    "about:blank",
+  );
 });
 
 test("--version matches the npm package version", async () => {

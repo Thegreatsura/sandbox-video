@@ -6,6 +6,7 @@ import { join } from "node:path";
 import test from "node:test";
 
 import {
+  startSession,
   stopSession,
   type OwnedProcessIdentity,
   type RecordingExecutables,
@@ -15,6 +16,77 @@ import {
 import type { UploadsPublication } from "../src/uploads.js";
 
 const linuxOnly = { skip: process.platform !== "linux" } as const;
+
+test("browser opens the configured URL before FFmpeg capture starts", linuxOnly, async () => {
+  const root = await mkdtemp(join(tmpdir(), "sandbox-video-start-order-"));
+  const executableDirectory = join(root, "bin");
+  const runtimeDirectory = join(root, "runtime");
+  const eventLog = join(root, "events.log");
+  await mkdir(executableDirectory, { recursive: true });
+
+  const paths = {
+    agentBrowser: join(executableDirectory, "agent-browser"),
+    ffmpeg: join(executableDirectory, "ffmpeg"),
+    ffprobe: join(executableDirectory, "ffprobe"),
+    mcookie: join(executableDirectory, "mcookie"),
+    openbox: join(executableDirectory, "openbox"),
+    xauth: join(executableDirectory, "xauth"),
+    xdpyinfo: join(executableDirectory, "xdpyinfo"),
+    xprop: join(executableDirectory, "xprop"),
+    xvfb: join(executableDirectory, "Xvfb"),
+  } satisfies Required<RecordingExecutables>;
+  const persistentProcess =
+    '#!/usr/bin/env node\nprocess.on("SIGINT",()=>process.exit(0));process.on("SIGTERM",()=>process.exit(0));setInterval(()=>{},1000);\n';
+
+  await Promise.all([
+    writeExecutable(
+      paths.agentBrowser,
+      `#!/usr/bin/env node\nrequire("node:fs").appendFileSync(${JSON.stringify(eventLog)}, "browser:" + process.argv.at(-1) + "\\n");\n`,
+    ),
+    writeExecutable(
+      paths.ffmpeg,
+      `#!/usr/bin/env node\nconst fs=require("node:fs");const args=process.argv.slice(2);fs.appendFileSync(${JSON.stringify(eventLog)},"ffmpeg\\n");const index=args.indexOf("-progress");if(index>=0)fs.writeFileSync(args[index+1],"frame=1\\nout_time_ms=16667\\nprogress=continue\\n");process.on("SIGINT",()=>process.exit(0));process.on("SIGTERM",()=>process.exit(0));setInterval(()=>{},1000);\n`,
+    ),
+    writeExecutable(paths.ffprobe, "#!/bin/sh\nexit 0\n"),
+    writeExecutable(paths.mcookie, "#!/bin/sh\nprintf 'abc123\\n'\n"),
+    writeExecutable(paths.openbox, persistentProcess),
+    writeExecutable(
+      paths.xauth,
+      '#!/usr/bin/env node\nrequire("node:fs").writeFileSync(process.argv[3],"");\n',
+    ),
+    writeExecutable(paths.xdpyinfo, "#!/bin/sh\nexit 0\n"),
+    writeExecutable(
+      paths.xprop,
+      "#!/bin/sh\nprintf '_NET_SUPPORTING_WM_CHECK(WINDOW): window id # 0x1\\n'\n",
+    ),
+    writeExecutable(paths.xvfb, persistentProcess),
+  ]);
+
+  try {
+    const initialUrl = "http://127.0.0.1:4173/proof";
+    const state = await startSession({
+      recordingId: "00000000-0000-4000-8000-000000000007",
+      runtimeDirectory,
+      width: 1280,
+      height: 720,
+      fps: 60,
+      initialUrl,
+      displayNumber: 65_007,
+      startupTimeoutMs: 5_000,
+      stopTimeoutMs: 2_000,
+      executables: paths,
+    });
+
+    assert.equal(state.phase, "recording");
+    assert.deepEqual((await readFile(eventLog, "utf8")).trim().split("\n").slice(0, 2), [
+      `browser:${initialUrl}`,
+      "ffmpeg",
+    ]);
+  } finally {
+    await stopSession({ runtimeDirectory, timeoutMs: 5_000 }).catch(() => undefined);
+    await rm(root, { recursive: true, force: true });
+  }
+});
 
 test(
   "recovery returns an existing publication without remuxing or uploading again",

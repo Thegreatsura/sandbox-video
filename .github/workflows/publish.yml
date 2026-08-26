@@ -1,0 +1,30 @@
+name: Publish npm package
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v6
+        with:
+          node-version: "24"
+          registry-url: https://registry.npmjs.org
+          package-manager-cache: false
+      - run: corepack enable
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm check
+      - run: pnpm test
+      - name: Check release tag
+        run: >-
+          node --input-type=module --eval
+          'import packageJson from "./package.json" with { type: "json" };
+          if (`v${packageJson.version}` !== process.env.GITHUB_REF_NAME) process.exit(1)'
+      - run: npm publish --access public
