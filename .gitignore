@@ -6,6 +6,7 @@ dist/
 .vercel/
 codedb.snapshot
 *.tgz
+.new-features/
 
 # Local proof artifacts are uploaded to durable storage, not committed.
 artifacts/
