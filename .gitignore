@@ -1,0 +1,15 @@
+node_modules/
+dist/
+.sandbox-video/
+.env.*
+!.env.example
+.vercel/
+codedb.snapshot
+*.tgz
+
+# Local proof artifacts are uploaded to durable storage, not committed.
+artifacts/
+*.mp4
+!docs/assets/sandbox-video-demo.mp4
+*.m3u8
+segment-*.ts

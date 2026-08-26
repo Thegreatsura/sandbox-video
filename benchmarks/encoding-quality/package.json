@@ -1,0 +1,11 @@
+{
+  "name": "sandbox-video-encoding-quality-benchmark",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "@vercel/sandbox": "3.1.0"
+  },
+  "engines": {
+    "node": ">=24"
+  }
+}
