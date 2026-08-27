@@ -1,0 +1,348 @@
+import { spawn, type ChildProcess } from "node:child_process";
+import { randomUUID } from "node:crypto";
+import { link, open, readFile, stat, unlink, writeFile } from "node:fs/promises";
+
+import {
+  delay,
+  hasCode,
+  isPositiveInteger,
+  isRecord,
+  parseObject,
+  readBoundedText,
+  settleWithin,
+} from "./util.js";
+
+export interface OwnedProcessIdentity {
+  readonly pid: number;
+  readonly startTimeTicks: string;
+  readonly executable: string;
+}
+
+export interface ManagedProcess {
+  readonly child: ChildProcess;
+  readonly identity: OwnedProcessIdentity;
+  readonly exit: Promise<ProcessExit>;
+}
+
+export interface ProcessExit {
+  readonly exitCode: number | null;
+  readonly signal: NodeJS.Signals | null;
+  readonly error?: string;
+}
+
+export function isIdentity(value: unknown): value is OwnedProcessIdentity {
+  return (
+    isRecord(value) &&
+    isPositiveInteger(value.pid) &&
+    typeof value.startTimeTicks === "string" &&
+    /^\d+$/u.test(value.startTimeTicks) &&
+    typeof value.executable === "string" &&
+    value.executable.length > 0 &&
+    !value.executable.includes("\0")
+  );
+}
+
+export async function processIdentity(
+  pid: number,
+  executableName: string,
+): Promise<OwnedProcessIdentity> {
+  const startTimeTicks = await readProcessStartTime(pid);
+  return { pid, startTimeTicks, executable: executableName };
+}
+
+export async function currentIdentity(): Promise<OwnedProcessIdentity> {
+  return processIdentity(process.pid, process.execPath);
+}
+
+export async function identityIsAlive(identity: OwnedProcessIdentity): Promise<boolean> {
+  try {
+    return (await readProcessStartTime(identity.pid)) === identity.startTimeTicks;
+  } catch (error) {
+    if (hasCode(error, "ENOENT") || hasCode(error, "ESRCH")) return false;
+    throw error;
+  }
+}
+
+async function readProcessStartTime(pid: number): Promise<string> {
+  if (!Number.isSafeInteger(pid) || pid <= 0) throw new Error("Invalid process PID");
+  const source = await readFile(`/proc/${pid}/stat`, "utf8");
+  const closing = source.lastIndexOf(")");
+  if (closing < 0) throw new Error(`Invalid /proc stat for PID ${pid}`);
+  const fields = source
+    .slice(closing + 1)
+    .trim()
+    .split(/\s+/u);
+  const startTimeTicks = fields[19];
+  if (startTimeTicks === undefined || !/^\d+$/u.test(startTimeTicks)) {
+    throw new Error(`Invalid process start time for PID ${pid}`);
+  }
+  return startTimeTicks;
+}
+
+export function sameIdentity(left: OwnedProcessIdentity, right: OwnedProcessIdentity): boolean {
+  return left.pid === right.pid && left.startTimeTicks === right.startTimeTicks;
+}
+
+export async function signalOwned(
+  identity: OwnedProcessIdentity,
+  signal: NodeJS.Signals,
+): Promise<void> {
+  if (!(await identityIsAlive(identity))) return;
+  try {
+    process.kill(identity.pid, signal);
+  } catch (error) {
+    if (!hasCode(error, "ESRCH")) throw error;
+  }
+}
+
+export async function waitForIdentityExit(
+  identity: OwnedProcessIdentity,
+  timeoutMs: number,
+): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (!(await identityIsAlive(identity))) return true;
+    await delay(50);
+  }
+  return !(await identityIsAlive(identity));
+}
+
+export async function stopOwned(
+  process: OwnedProcessIdentity,
+  signal: NodeJS.Signals,
+  timeoutMs: number,
+): Promise<void> {
+  if (!(await identityIsAlive(process))) return;
+  await signalOwned(process, signal);
+  if (await waitForIdentityExit(process, timeoutMs)) return;
+  await signalOwned(process, "SIGKILL");
+  if (!(await waitForIdentityExit(process, 2_000))) {
+    throw new Error(`${process.executable} did not exit after SIGKILL`);
+  }
+}
+
+export async function tryCreateOwnedLock(
+  path: string,
+  owner: OwnedProcessIdentity,
+): Promise<boolean> {
+  const temporary = `${path}.${randomUUID()}.candidate`;
+  await writeFile(temporary, `${JSON.stringify(owner)}\n`, {
+    encoding: "utf8",
+    flag: "wx",
+    mode: 0o600,
+  });
+  try {
+    try {
+      await link(temporary, path);
+      return true;
+    } catch (error) {
+      if (hasCode(error, "EEXIST")) return false;
+      throw error;
+    }
+  } finally {
+    await unlink(temporary).catch(() => undefined);
+  }
+}
+
+export async function readLockOwner(path: string): Promise<OwnedProcessIdentity | null> {
+  try {
+    return parseLockOwner(await readBoundedText(path));
+  } catch {
+    return null;
+  }
+}
+
+function parseLockOwner(source: string): OwnedProcessIdentity | null {
+  try {
+    const parsed = parseObject(source, "lock");
+    return isIdentity(parsed) ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
+interface LockFileIdentity {
+  readonly device: bigint;
+  readonly inode: bigint;
+  readonly size: bigint;
+  readonly modifiedAtNs: bigint;
+  readonly changedAtNs: bigint;
+}
+
+async function lockFileIdentity(path: string): Promise<LockFileIdentity | null> {
+  try {
+    const details = await stat(path, { bigint: true });
+    return {
+      device: details.dev,
+      inode: details.ino,
+      size: details.size,
+      modifiedAtNs: details.mtimeNs,
+      changedAtNs: details.ctimeNs,
+    };
+  } catch (error) {
+    if (hasCode(error, "ENOENT")) return null;
+    throw error;
+  }
+}
+
+function sameLockFile(left: LockFileIdentity, right: LockFileIdentity): boolean {
+  return (
+    left.device === right.device &&
+    left.inode === right.inode &&
+    left.size === right.size &&
+    left.modifiedAtNs === right.modifiedAtNs &&
+    left.changedAtNs === right.changedAtNs
+  );
+}
+
+async function unlinkUnchangedLock(path: string, observed: LockFileIdentity): Promise<boolean> {
+  const current = await lockFileIdentity(path);
+  if (current === null) return true;
+  if (!sameLockFile(current, observed)) return false;
+  try {
+    await unlink(path);
+    return true;
+  } catch (error) {
+    if (hasCode(error, "ENOENT")) return true;
+    throw error;
+  }
+}
+
+/**
+ * Remove a lock believed stale without ever deleting a live owner's lock:
+ * removal is serialized through a short-lived breaker lock, and only the
+ * breaker holder may unlink the target, after re-verifying under the breaker
+ * that its recorded owner is really dead (or its content unreadable). A
+ * contender that replaced the lock between the caller's look and the removal
+ * is therefore seen as live and left untouched.
+ */
+export async function removeStaleLock(
+  path: string,
+  breaker: OwnedProcessIdentity,
+): Promise<boolean> {
+  const breakerPath = `${path}.breaker`;
+  if (!(await tryCreateOwnedLock(breakerPath, breaker))) {
+    // Unlink a contender's breaker only when its holder was actually read and
+    // is dead; a null read (vanished or unreadable) must not remove a breaker
+    // that a live contender may have just created.
+    const observed = await lockFileIdentity(breakerPath);
+    if (observed === null) return false;
+    let holder: OwnedProcessIdentity | null;
+    try {
+      holder = parseLockOwner(await readBoundedText(breakerPath));
+    } catch {
+      return false;
+    }
+    if (holder !== null && !(await identityIsAlive(holder))) {
+      await unlinkUnchangedLock(breakerPath, observed);
+    }
+    return false;
+  }
+  try {
+    const observed = await lockFileIdentity(path);
+    if (observed === null) return true;
+    let current: OwnedProcessIdentity | null = null;
+    try {
+      current = parseLockOwner(await readBoundedText(path));
+    } catch (error) {
+      if (hasCode(error, "ENOENT")) return true;
+      // An unreadable lock (oversize, interference) can never be verified
+      // live; treat it as corrupt and removable, as the caller already did.
+    }
+    if (current !== null && (await identityIsAlive(current))) return false;
+    return unlinkUnchangedLock(path, observed);
+  } finally {
+    await releaseOwnedLock(breakerPath, breaker);
+  }
+}
+
+export async function releaseOwnedLock(path: string, owner: OwnedProcessIdentity): Promise<void> {
+  const observed = await lockFileIdentity(path);
+  if (observed === null) return;
+  const current = await readLockOwner(path);
+  if (current !== null && sameIdentity(current, owner)) {
+    await unlinkUnchangedLock(path, observed);
+  }
+}
+
+export async function acquireRecoveryLock(
+  path: string,
+  owner: OwnedProcessIdentity,
+): Promise<boolean> {
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    if (await tryCreateOwnedLock(path, owner)) return true;
+    const current = await readLockOwner(path);
+    if (current !== null && (await identityIsAlive(current))) return false;
+    await removeStaleLock(path, owner);
+  }
+  // A removal on the final attempt must still get its create retry, or a
+  // freed lock would be reported as unacquirable.
+  return tryCreateOwnedLock(path, owner);
+}
+
+export async function spawnManaged(
+  argv: readonly [string, ...string[]],
+  environment: NodeJS.ProcessEnv,
+  logPath: string,
+): Promise<ManagedProcess> {
+  const log = await open(logPath, "a", 0o600);
+  try {
+    const child = spawn(argv[0], argv.slice(1), {
+      env: environment,
+      shell: false,
+      stdio: ["ignore", log.fd, log.fd],
+    });
+    await waitForSpawn(child);
+    if (child.pid === undefined) throw new Error(`${argv[0]} did not report a PID`);
+    const identity = await processIdentity(child.pid, argv[0]);
+    const exit = observeExit(child);
+    return { child, identity, exit };
+  } finally {
+    await log.close();
+  }
+}
+
+function observeExit(child: ChildProcess): Promise<ProcessExit> {
+  return new Promise((resolve) => {
+    child.once("error", (error) => resolve({ exitCode: null, signal: null, error: error.message }));
+    child.once("exit", (exitCode, signal) => resolve({ exitCode, signal }));
+  });
+}
+
+export async function unexpectedExit(
+  label: string,
+  process: ManagedProcess,
+): Promise<{ readonly type: "exit"; readonly message: string }> {
+  const result = await process.exit;
+  return {
+    type: "exit",
+    message: `${label} exited unexpectedly (${formatExit(result)})`,
+  };
+}
+
+export async function stopManaged(
+  process: ManagedProcess,
+  signal: NodeJS.Signals,
+  timeoutMs: number,
+): Promise<void> {
+  if (process.child.exitCode !== null || process.child.signalCode !== null) return;
+  process.child.kill(signal);
+  if ((await settleWithin(process.exit, timeoutMs)) !== null) return;
+  process.child.kill("SIGKILL");
+  if ((await settleWithin(process.exit, 2_000)) === null) {
+    throw new Error(`${process.identity.executable} did not exit after SIGKILL`);
+  }
+}
+
+export async function waitForSpawn(child: ChildProcess): Promise<void> {
+  await new Promise<void>((resolve, reject) => {
+    child.once("spawn", resolve);
+    child.once("error", reject);
+  });
+}
+
+export function formatExit(result: ProcessExit): string {
+  if (result.error !== undefined) return result.error;
+  if (result.exitCode !== null) return `exit ${result.exitCode}`;
+  return result.signal ?? "unknown termination";
+}

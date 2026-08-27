@@ -11,8 +11,9 @@ import {
   type RecordingSessionPhase,
   type RecordingSessionStatus,
 } from "./session.js";
+import { defined, delay } from "./util.js";
 
-const CLI_VERSION = "0.1.2";
+const CLI_VERSION = "0.1.3";
 const SCHEMA_VERSION = 1 as const;
 const RUNTIME_ROOT = "/tmp/sandbox-video";
 const DEFAULT_WIDTH = 1920;
@@ -50,6 +51,13 @@ const COMMANDS = [
         type: "string",
         required: false,
         sourceFallback: "UPLOADS_WORKSPACE",
+      },
+      {
+        name: "--startup-timeout-ms",
+        type: "integer",
+        required: false,
+        default: 30_000,
+        description: "Fail start if the recording is not capturing within this window.",
       },
     ],
     agentInstructions: [
@@ -109,71 +117,81 @@ const COMMANDS = [
   },
 ] as const;
 
+const INFO_COMMANDS = new Map<string, { readonly label: string; readonly payload: () => object }>([
+  ["--help", { label: "help", payload: helpPayload }],
+  ["help", { label: "help", payload: helpPayload }],
+  ["manifest", { label: "help", payload: helpPayload }],
+  ["--brief", { label: "brief", payload: () => ({ brief: brief() }) }],
+  ["--version", { label: "version", payload: () => ({ version: CLI_VERSION }) }],
+]);
+
+const SUBCOMMANDS = new Map<string, (argv: readonly string[]) => Promise<number>>([
+  ["start", startCommand],
+  ["status", statusCommand],
+  ["stop", stopCommand],
+]);
+
 async function main(argv: readonly string[]): Promise<number> {
   const command = argv[0];
   if (command === undefined) {
     writeSuccess(helpPayload(), "help", "none");
     return 0;
   }
-  if (command === "--help" || command === "help" || command === "manifest") {
-    if (argv.length !== 1)
-      return fail(new UsageError(`${command} does not accept arguments`), command);
-    writeSuccess(helpPayload(), "help", "none");
-    return 0;
-  }
-  if (command === "--brief") {
-    if (argv.length !== 1)
-      return fail(new UsageError("--brief does not accept arguments"), command);
-    writeSuccess({ brief: brief() }, "brief", "none");
-    return 0;
-  }
-  if (command === "--version") {
-    if (argv.length !== 1)
-      return fail(new UsageError("--version does not accept arguments"), command);
-    writeSuccess({ version: CLI_VERSION }, "version", "none");
-    return 0;
-  }
-  if (new Set(["start", "status", "stop"]).has(command) && argv[1] === "--help") {
-    if (argv.length !== 2)
-      return fail(new UsageError("--help does not accept other arguments"), command);
-    writeSuccess({ command: commandDefinition(command) }, `${command} --help`, "none");
-    return 0;
-  }
-
   try {
-    if (command === "start") return await startCommand(argv.slice(1));
-    if (command === "status") return await statusCommand(argv.slice(1));
-    if (command === "stop") return await stopCommand(argv.slice(1));
-    throw new UsageError(
-      `Unknown command: ${command}`,
-      "Run 'sandbox-video --help' and select a command from data.commands.",
-    );
+    const info = INFO_COMMANDS.get(command);
+    if (info !== undefined) {
+      if (argv.length !== 1) throw new UsageError(`${command} does not accept arguments`);
+      writeSuccess(info.payload(), info.label, "none");
+      return 0;
+    }
+    const run = SUBCOMMANDS.get(command);
+    if (run === undefined) {
+      throw new UsageError(
+        `Unknown command: ${command}`,
+        "Run 'sandbox-video --help' and select a command from data.commands.",
+      );
+    }
+    if (argv[1] === "--help") {
+      if (argv.length !== 2) throw new UsageError("--help does not accept other arguments");
+      writeSuccess({ command: commandDefinition(command) }, `${command} --help`, "none");
+      return 0;
+    }
+    return await run(argv.slice(1));
   } catch (error) {
     return fail(error, command);
   }
 }
 
 async function startCommand(argv: readonly string[]): Promise<number> {
-  const flags = parseFlags(argv, new Set(["fps", "size", "url", "uploads-workspace"]));
-  const recordingId = randomUUID();
-  const fpsValue = integer(optionalFlag(flags, "fps") ?? String(DEFAULT_FPS), "--fps");
-  if (fpsValue !== 30 && fpsValue !== 60) throw new UsageError("--fps must be 30 or 60");
-  const { width, height } = parseSize(
-    optionalFlag(flags, "size") ?? `${DEFAULT_WIDTH}x${DEFAULT_HEIGHT}`,
+  const flags = parseFlags(
+    argv,
+    new Set(["fps", "size", "url", "uploads-workspace", "startup-timeout-ms"]),
   );
-  const workspace = optionalFlag(flags, "uploads-workspace") ?? process.env.UPLOADS_WORKSPACE;
-  const initialUrl = optionalFlag(flags, "url");
+  const recordingId = randomUUID();
+  const fpsValue = integer(flags.get("fps") ?? String(DEFAULT_FPS), "--fps");
+  if (fpsValue !== 30 && fpsValue !== 60) throw new UsageError("--fps must be 30 or 60");
+  const { width, height } = parseSize(flags.get("size") ?? `${DEFAULT_WIDTH}x${DEFAULT_HEIGHT}`);
+  const workspace = flags.get("uploads-workspace") ?? process.env.UPLOADS_WORKSPACE;
+  const initialUrl = flags.get("url");
+  const startupTimeout = flags.get("startup-timeout-ms");
+  const startupTimeoutMs =
+    startupTimeout === undefined ? undefined : integer(startupTimeout, "--startup-timeout-ms");
   const state = await startSession({
     recordingId,
     runtimeDirectory: runtimeDirectoryFor(recordingId),
     width,
     height,
     fps: fpsValue,
-    ...(initialUrl === undefined ? {} : { initialUrl }),
+    ...defined({ initialUrl, startupTimeoutMs }),
     upload: {
       key: `screenshots/sandbox-video/${recordingId}/proof.mp4`,
-      ...(workspace === undefined ? {} : { workspace }),
+      ...defined({ workspace }),
     },
+  }).catch((error: unknown) => {
+    throw new CommandError(
+      `Recording ${recordingId} failed to start: ${error instanceof Error ? error.message : String(error)}`,
+      `Inspect /tmp/sandbox-video/${recordingId} for retained state and logs; run sandbox-video stop --recording-id ${recordingId} if a partial recording remains.`,
+    );
   });
   if (state.phase !== "recording")
     throw new Error(state.failure ?? `Recording startup ended in phase ${state.phase}`);
@@ -222,32 +240,31 @@ async function stopCommand(argv: readonly string[]): Promise<number> {
   const flags = parseFlags(argv, new Set(["recording-id", "timeout-ms"]));
   const recordingId = requiredFlag(flags, "recording-id");
   const timeoutMs = integer(
-    optionalFlag(flags, "timeout-ms") ?? String(DEFAULT_STOP_TIMEOUT_MS),
+    flags.get("timeout-ms") ?? String(DEFAULT_STOP_TIMEOUT_MS),
     "--timeout-ms",
   );
   const runtimeDirectory = runtimeDirectoryFor(recordingId);
   const initial = await getSessionStatus(runtimeDirectory);
   if (!initial.exists) throw new NotFoundError(recordingId);
   const stop = stopSession({ runtimeDirectory, timeoutMs });
-  void stop.catch(() => undefined);
+  let stopSettled = false;
+  const settle = () => {
+    stopSettled = true;
+  };
+  void stop.then(settle, settle);
   const seen = new Set<RecordingSessionPhase>();
   emitStopPhases(
     initial.state.phaseHistory.map((entry) => entry.phase),
     seen,
     recordingId,
   );
-  const deadline = Date.now() + timeoutMs;
-  while (Date.now() < deadline) {
-    const current = await getSessionStatus(runtimeDirectory);
-    if (!current.exists) break;
-    emitStopPhases(
-      current.state.phaseHistory.map((entry) => entry.phase),
-      seen,
-      recordingId,
-    );
-    if (current.state.phase === "finished" || current.state.phase === "failed") break;
-    await delay(POLL_INTERVAL_MS);
-  }
+  await pollStopProgress(
+    runtimeDirectory,
+    recordingId,
+    seen,
+    Date.now() + timeoutMs,
+    () => stopSettled,
+  );
   const result = await stop;
   if (!result.exists) throw new NotFoundError(recordingId);
   emitStopPhases(
@@ -268,6 +285,26 @@ async function stopCommand(argv: readonly string[]): Promise<number> {
   return 0;
 }
 
+async function pollStopProgress(
+  runtimeDirectory: string,
+  recordingId: string,
+  seen: Set<RecordingSessionPhase>,
+  deadline: number,
+  stopSettled: () => boolean,
+): Promise<void> {
+  while (!stopSettled() && Date.now() < deadline) {
+    const current = await getSessionStatus(runtimeDirectory);
+    if (!current.exists) return;
+    emitStopPhases(
+      current.state.phaseHistory.map((entry) => entry.phase),
+      seen,
+      recordingId,
+    );
+    if (current.state.phase === "finished" || current.state.phase === "failed") return;
+    await delay(POLL_INTERVAL_MS);
+  }
+}
+
 function statusPayload(status: Extract<RecordingSessionStatus, { readonly exists: true }>): object {
   const { state } = status;
   return {
@@ -277,10 +314,10 @@ function statusPayload(status: Extract<RecordingSessionStatus, { readonly exists
     capture: status.capture,
     startedAt: state.startedAt,
     updatedAt: state.updatedAt,
-    ...(state.finishedAt === undefined ? {} : { finishedAt: state.finishedAt }),
+    ...defined({ finishedAt: state.finishedAt }),
     ...(state.publication === undefined ? {} : state.publication),
-    ...(state.failure === undefined ? {} : { error: state.failure }),
-    ...(state.warnings === undefined ? {} : { warnings: state.warnings }),
+    ...defined({ error: state.failure }),
+    ...defined({ warnings: state.warnings }),
   };
 }
 
@@ -411,10 +448,6 @@ function requiredFlag(flags: ReadonlyMap<string, string>, name: string): string 
   return value;
 }
 
-function optionalFlag(flags: ReadonlyMap<string, string>, name: string): string | undefined {
-  return flags.get(name);
-}
-
 function fail(error: unknown, command: string): number {
   writeError(error, command);
   if (error instanceof UsageError) return EXIT_USAGE;
@@ -466,10 +499,6 @@ function safeMessage(error: unknown): string {
   return secrets
     .reduce((safe, secret) => safe.replaceAll(secret, "[redacted]"), message)
     .slice(0, 2_000);
-}
-
-function delay(milliseconds: number): Promise<void> {
-  return new Promise((resolveDelay) => setTimeout(resolveDelay, milliseconds));
 }
 
 class CliError extends Error {

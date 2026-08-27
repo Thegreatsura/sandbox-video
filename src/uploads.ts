@@ -1,6 +1,7 @@
 import { stat } from "node:fs/promises";
 
-import { runExact } from "./process.js";
+import { runExact, type ExactCommandResult } from "./process.js";
+import { defined, delay, isRecord } from "./util.js";
 
 const OUTPUT_LIMIT_BYTES = 1_000_000;
 const DEFAULT_TIMEOUT_MS = 5 * 60_000;
@@ -28,11 +29,7 @@ export interface UploadsPublication {
 export async function uploadFinalMp4(options: UploadFinalMp4Options): Promise<UploadsPublication> {
   assertUploadsKey(options.key);
   if (options.workspace !== undefined) assertUploadsWorkspace(options.workspace);
-  const source = await stat(options.filePath);
-  if (!source.isFile() || !Number.isSafeInteger(source.size) || source.size <= 0) {
-    throw new Error("Final MP4 must be a non-empty regular file");
-  }
-
+  const sizeBytes = await sourceFileSize(options.filePath);
   const environment = uploadsEnvironment(options.environment ?? process.env, options.workspace);
   const workspaceArgs = options.workspace === undefined ? [] : ["--workspace", options.workspace];
   const result = await runExact(
@@ -57,20 +54,11 @@ export async function uploadFinalMp4(options: UploadFinalMp4Options): Promise<Up
       environment,
       timeoutMs: options.timeoutMs ?? DEFAULT_TIMEOUT_MS,
       outputLimitBytes: OUTPUT_LIMIT_BYTES,
-      ...(options.signal === undefined ? {} : { signal: options.signal }),
+      ...defined({ signal: options.signal }),
     },
   );
-  if (result.exitCode !== 0) {
-    const termination =
-      result.error ??
-      (result.exitCode === null
-        ? `terminated by ${result.signal ?? "an unknown signal"}`
-        : `exited ${result.exitCode}`);
-    throw new Error(
-      `uploads put ${termination}: ${safeDetail(result.stderr || result.stdout, environment)}`,
-    );
-  }
-  const publication = parseUploadsPublication(result.stdout, options.key, source.size);
+  if (result.exitCode !== 0) throw uploadFailure(result, environment);
+  const publication = parseUploadsPublication(result.stdout, options.key, sizeBytes);
   await verifyHostedPublication(
     publication,
     Math.min(options.timeoutMs ?? DEFAULT_TIMEOUT_MS, 10_000),
@@ -105,20 +93,8 @@ export function parseUploadsPublication(
     throw new Error("uploads put response is missing its URL");
   }
   const url = parsePublicUrl(parsed.url);
-  if (
-    parsed.size !== undefined &&
-    parsed.size !== null &&
-    (!Number.isSafeInteger(parsed.size) || parsed.size !== expectedSizeBytes)
-  ) {
-    throw new Error("uploads put returned an unexpected file size");
-  }
-  if (
-    parsed.sizeBytes !== undefined &&
-    parsed.sizeBytes !== null &&
-    (!Number.isSafeInteger(parsed.sizeBytes) || parsed.sizeBytes !== expectedSizeBytes)
-  ) {
-    throw new Error("uploads put returned an unexpected file size");
-  }
+  assertReportedSize(parsed.size, expectedSizeBytes);
+  assertReportedSize(parsed.sizeBytes, expectedSizeBytes);
   return {
     key: expectedKey,
     url,
@@ -144,21 +120,43 @@ export function assertUploadsWorkspace(workspace: string): void {
   }
 }
 
+async function sourceFileSize(filePath: string): Promise<number> {
+  const source = await stat(filePath);
+  if (!source.isFile() || !Number.isSafeInteger(source.size) || source.size <= 0) {
+    throw new Error("Final MP4 must be a non-empty regular file");
+  }
+  return source.size;
+}
+
+function uploadFailure(result: ExactCommandResult, environment: NodeJS.ProcessEnv): Error {
+  const termination =
+    result.error ??
+    (result.exitCode === null
+      ? `terminated by ${result.signal ?? "an unknown signal"}`
+      : `exited ${result.exitCode}`);
+  return new Error(
+    `uploads put ${termination}: ${safeDetail(result.stderr || result.stdout, environment)}`,
+  );
+}
+
+function assertReportedSize(value: unknown, expectedSizeBytes: number): void {
+  if (value === undefined || value === null) return;
+  if (!Number.isSafeInteger(value) || value !== expectedSizeBytes) {
+    throw new Error("uploads put returned an unexpected file size");
+  }
+}
+
 function uploadsEnvironment(source: NodeJS.ProcessEnv, workspace?: string): NodeJS.ProcessEnv {
   const token = source.UPLOADS_TOKEN;
   return {
     PATH: source.PATH ?? "/usr/local/bin:/usr/bin:/bin",
-    ...(source.HOME === undefined ? {} : { HOME: source.HOME }),
-    ...(source.XDG_CONFIG_HOME === undefined ? {} : { XDG_CONFIG_HOME: source.XDG_CONFIG_HOME }),
-    ...(source.BUILDINTERNET_CONFIG === undefined
-      ? {}
-      : { BUILDINTERNET_CONFIG: source.BUILDINTERNET_CONFIG }),
+    ...defined({ HOME: source.HOME }),
+    ...defined({ XDG_CONFIG_HOME: source.XDG_CONFIG_HOME }),
+    ...defined({ BUILDINTERNET_CONFIG: source.BUILDINTERNET_CONFIG }),
     ...(token === undefined || token.length === 0 ? {} : { UPLOADS_TOKEN: token }),
-    ...(workspace === undefined ? {} : { UPLOADS_WORKSPACE: workspace }),
-    ...(source.UPLOADS_API_URL === undefined ? {} : { UPLOADS_API_URL: source.UPLOADS_API_URL }),
-    ...(source.UPLOADS_SESSION_TOKEN === undefined
-      ? {}
-      : { UPLOADS_SESSION_TOKEN: source.UPLOADS_SESSION_TOKEN }),
+    ...defined({ UPLOADS_WORKSPACE: workspace }),
+    ...defined({ UPLOADS_API_URL: source.UPLOADS_API_URL }),
+    ...defined({ UPLOADS_SESSION_TOKEN: source.UPLOADS_SESSION_TOKEN }),
   };
 }
 
@@ -173,10 +171,6 @@ function parsePublicUrl(source: string): string {
     throw new Error("uploads put returned a non-public URL");
   }
   return url.toString();
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null;
 }
 
 async function verifyHostedPublication(
@@ -206,19 +200,17 @@ async function verifyHostedPublication(
     } catch (error) {
       detail = error instanceof Error ? error.message : String(error);
     }
-    await new Promise((resolve) => setTimeout(resolve, 250));
+    await delay(250);
   }
   throw new Error(`Uploaded MP4 verification failed: ${detail}`);
 }
 
 function safeDetail(source: string, environment: NodeJS.ProcessEnv): string {
   let detail = source.trim() || "no error output";
-  for (const name of ["UPLOADS_TOKEN", "UPLOADS_SESSION_TOKEN"] as const) {
-    const value = environment[name];
-    if (value !== undefined && value.length > 0) detail = detail.replaceAll(value, "[REDACTED]");
-  }
-  for (const value of Object.values(environment)) {
-    if (value !== undefined && value.length >= 8) detail = detail.replaceAll(value, "[REDACTED]");
+  for (const [name, value] of Object.entries(environment)) {
+    if (/(?:TOKEN|SECRET|PASSWORD|AUTH)/iu.test(name) && value !== undefined && value.length > 0) {
+      detail = detail.replaceAll(value, "[REDACTED]");
+    }
   }
   return detail.slice(0, 1_000);
 }

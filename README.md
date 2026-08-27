@@ -37,6 +37,11 @@ sandbox-video start \
   --size 1920x1080
 ```
 
+Startup waits up to 30 seconds for the browser and FFmpeg capture to become
+ready. Use `--startup-timeout-ms` to adjust that window for a slower Sandbox.
+If startup times out, the CLI stops the detached supervisor and its owned
+processes before returning the failure.
+
 The CLI opens `--url` before FFmpeg starts. This keeps browser startup and the
 black X11 root window out of the recording. If `--url` is omitted, the browser
 opens `about:blank`.
@@ -66,7 +71,7 @@ command leaves stdout empty and writes one JSON error envelope to stderr:
     ]
   },
   "meta": {
-    "cliVersion": "0.1.2",
+    "cliVersion": "0.1.3",
     "command": "start",
     "effect": "recording-started"
   }
@@ -165,10 +170,10 @@ npm install --global .
 Install the published CLI inside a prepared Sandbox image:
 
 ```sh
-npm install --global sandbox-video@0.1.2
+npm install --global sandbox-video@0.1.3
 ```
 
-An agent can instead use `npx --yes sandbox-video@0.1.2 <command>`. Pin the
+An agent can instead use `npx --yes sandbox-video@0.1.3 <command>`. Pin the
 same exact version for `start`, `status`, and `stop`. There is intentionally no
 self-update command or automatic update check: npm/npx owns installation, and
 the response schema must not change in the middle of a recording lifecycle.

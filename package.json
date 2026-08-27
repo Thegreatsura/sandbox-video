@@ -1,6 +1,6 @@
 {
   "name": "sandbox-video",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "private": false,
   "description": "High-FPS proof video capture for agent-browser sessions in Vercel Sandbox",
   "keywords": [
@@ -22,10 +22,7 @@
     "sandbox-video": "dist/src/cli.js"
   },
   "files": [
-    "dist/src/cli.*",
-    "dist/src/process.*",
-    "dist/src/session.*",
-    "dist/src/uploads.*",
+    "dist/src",
     "README.md",
     "SKILL.md"
   ],
