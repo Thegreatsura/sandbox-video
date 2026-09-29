@@ -1,9 +1,10 @@
 # sandbox-video
 
 `sandbox-video` records the headed browser while an AI coding agent works inside
-a Vercel Sandbox. It aims for 60 FPS when the machine has room, backs off when
-the agent needs the CPU, and publishes one browser-compatible MP4 through
-[`uploads.sh`](https://uploads.sh).
+a Vercel Sandbox. It aims for 60 FPS when the machine has room and gives agent
+work priority when CPU is tight. It produces one browser-compatible MP4 and
+uploads it through [`uploads.sh`](https://uploads.sh) by default. Use
+`--upload none` to keep the MP4 on the recording machine.
 
 The CLI works alongside
 [`agent-browser`](https://github.com/vercel-labs/agent-browser). It leaves the
@@ -26,6 +27,7 @@ The coding agent is already running inside the Vercel Sandbox:
 
 ```text
 start -> use returned agent-browser command -> status -> stop -> uploads.sh URL
+                                                              -> local MP4 path (--upload none)
 ```
 
 Start recording on the page you want to validate:
@@ -89,6 +91,7 @@ command leaves stdout empty and writes one JSON error envelope to stderr:
   "data": {
     "status": "recording",
     "recordingId": "865a5385-54c0-4efa-8b61-5013e6391737",
+    "upload": "uploads.sh",
     "fps": 60,
     "capturePolicy": {
       "mode": "auto",
@@ -106,7 +109,7 @@ command leaves stdout empty and writes one JSON error envelope to stderr:
     ]
   },
   "meta": {
-    "cliVersion": "0.2.0",
+    "cliVersion": "0.3.0",
     "command": "start",
     "effect": "recording-started"
   }
@@ -134,25 +137,67 @@ sandbox-video status \
   --recording-id 865a5385-54c0-4efa-8b61-5013e6391737
 ```
 
-Finalize and publish:
+Finish the recording:
 
 ```sh
 sandbox-video stop \
   --recording-id 865a5385-54c0-4efa-8b61-5013e6391737
 ```
 
-`stop` reports five newline-delimited JSON progress events on stderr so an
-agent knows work is continuing:
+`stop` reports five newline-delimited JSON progress events on stderr. With
+`--upload none`, it reports four steps and skips `uploading_mp4`:
 
 ```json
 {"schemaVersion":1,"type":"progress","command":"stop","recordingId":"865a5385-54c0-4efa-8b61-5013e6391737","step":1,"totalSteps":5,"phase":"closing_browser"}
 {"schemaVersion":1,"type":"progress","command":"stop","recordingId":"865a5385-54c0-4efa-8b61-5013e6391737","step":2,"totalSteps":5,"phase":"stopping_capture"}
 ```
 
-Its one stdout JSON object contains the terminal status, hosted URL, storage
-key, content type, byte size, measured frame rate, frame count, and duration.
-Repeating `stop` returns the same terminal result without recording, probing,
-or uploading again.
+On success, the stdout JSON response includes the upload mode, absolute MP4
+`path`, content type, byte size, and recording metrics. It also includes the
+hosted `url` and storage `key` when uploads.sh is selected. Repeating a
+successful `stop` returns the same result without recording, probing, or
+uploading again.
+
+### Keep the MP4 local
+
+Pass `--upload none` to `start` to save the MP4 without uploading it. Your agent
+can then attach the file to a pull request with the GitHub CLI:
+
+```sh
+sandbox-video start --url http://127.0.0.1:3000 --upload none
+# ... agent-browser validation ...
+sandbox-video stop --recording-id <id>
+gh pr comment <pr> --attach "<data.path>" --body "Login flow after the fix"
+```
+
+Run `gh` on the recording machine, or copy the MP4 to the machine running
+`gh` first. Use a GitHub CLI version that supports `--attach`. Videos render
+as a player and do not accept image alt text. See the
+[`gh pr comment` documentation](https://cli.github.com/manual/gh_pr_comment).
+
+To make local recording the default in your environment, set:
+
+```sh
+export SANDBOX_VIDEO_UPLOAD=none
+```
+
+An explicit `--upload` flag overrides this environment setting. If neither is
+set, the CLI uses uploads.sh. `start` stores the choice with the recording.
+Later changes to the environment do not affect that recording. Each command
+reports the stored choice as `data.upload`.
+
+With `none`, the CLI needs no uploads.sh installation or credentials. It
+rejects an explicit `--uploads-workspace` and ignores `UPLOADS_WORKSPACE`.
+`stop` returns `path`, `contentType`, `sizeBytes`, and recording metrics, with
+`meta.effect` set to `proof-saved`. The response has no `url` or `key`.
+
+The MP4 lives at `/tmp/sandbox-video/<recording-id>/recording.mp4` on the
+recording machine. The CLI verifies the file before returning its path. It
+does not retain a separate copy if you delete the file or end the Sandbox.
+Copy or attach it before the Sandbox ends. GitHub
+[caps attached videos](https://docs.github.com/en/get-started/writing-on-github/working-with-advanced-formatting/attaching-files)
+at 10 MB on free plans and 100 MB on paid plans. Compare the limit with
+`sizeBytes` before attaching. The 24-second 1080p60 demo above is about 2.3 MB.
 
 ## Runtime ownership
 
@@ -177,19 +222,25 @@ The supervisor stores local HLS segments while recording. On explicit stop it
 closes Chrome, drains FFmpeg, stream-copy remuxes the playlist with `+faststart`
 to a temporary MP4, verifies its codec, pixel format, geometry, positive
 measured frame rate, frame count, duration, and full decode, then atomically
-installs and uploads the final MP4. The measured frame rate does not have to
-equal the requested rate. The CLI verifies the hosted content type and byte
-length before returning the URL and removes the owned processes. HLS is an
-internal crash recovery format, not a public artifact.
+installs the final MP4 and records its size. With uploads.sh selected, it then
+uploads the MP4. The measured frame rate does not have to equal the requested
+rate. The CLI verifies the hosted content type and byte length before returning
+the URL and removes the owned processes. An upload failure keeps the verified
+MP4 and its recorded metadata. HLS is an internal crash recovery format, not a
+public artifact.
 
 ## Requirements inside the Sandbox
+
+The CLI is Linux-only: it runs its own Xvfb display and reads process identity
+from `/proc`. It is verified in Vercel Sandbox.
 
 - Node.js 24 or later
 - FFmpeg with `x11grab` and `libx264`, plus ffprobe
 - `nice` from GNU coreutils
 - Xvfb, openbox, xauth, mcookie, xdpyinfo, and xprop
 - agent-browser and its Chromium installation
-- uploads.sh CLI 0.48.0 or later, authenticated with `uploads login`
+- uploads.sh CLI 0.48.0 or later, authenticated with `uploads login`, unless
+  every recording uses `--upload none`
 
 uploads.sh reads its normal shared configuration from
 `$XDG_CONFIG_HOME/buildinternet/config` or
@@ -208,10 +259,10 @@ npm install --global .
 Install the published CLI inside a prepared Sandbox image:
 
 ```sh
-npm install --global sandbox-video@0.2.0
+npm install --global sandbox-video@0.3.0
 ```
 
-An agent can instead use `npx --yes sandbox-video@0.2.0 <command>`. Pin the
+An agent can instead use `npx --yes sandbox-video@0.3.0 <command>`. Pin the
 same exact version for `start`, `status`, and `stop`. There is intentionally no
 self-update command or automatic update check: npm/npx owns installation, and
 the response schema must not change in the middle of a recording lifecycle.
@@ -295,12 +346,17 @@ remained, and the Sandbox was explicitly stopped.
 
 The CLI uses four exit codes:
 
-| Exit | Meaning                                                   |
-| ---: | --------------------------------------------------------- |
-|  `0` | Command completed; for `stop`, the final MP4 is uploaded  |
-|  `2` | Invalid command, option, or recording ID                  |
-|  `4` | Startup, capture, finalization, upload, or cleanup failed |
-| `20` | Recording ID does not exist in this Sandbox filesystem    |
+| Exit | Meaning                                                                       |
+| ---: | ----------------------------------------------------------------------------- |
+|  `0` | Command completed; `stop` verified the MP4 and completed any requested upload |
+|  `2` | Invalid command, option, or recording ID                                      |
+|  `4` | Startup, capture, finalization, upload, or cleanup failed                     |
+| `20` | Recording ID does not exist in this Sandbox filesystem                        |
+
+If an upload or cleanup fails after MP4 verification, `stop` and `status`
+return an error with `error.artifact`. It contains the local file's `path`,
+`contentType`, and `sizeBytes`. The caller can still use that file. Repeating
+`stop` attempts recovery, but the CLI does not retry automatically.
 
 The current uploads.sh integration publishes only after explicit `stop`. Local
 HLS segments can recover from a supervisor failure while the Sandbox filesystem
